@@ -905,7 +905,34 @@ module i2c_rx #(
     end
 
   `endif
-
+  `ifndef SYNTHESIS
+    always @(posedge clk_ref) begin
+    
+      if (state_q == ST_ADDR_ACK ||
+          state_q == ST_CTRL_ACK ||
+          state_q == ST_WR_ACK ||
+          state_q == ST_RD_ACK_WAIT) begin
+          
+        $display(
+          "[I2C ACK DEBUG] state=%0d addr7=0x%02h rw=%b addr_match=%b gc_match=%b sda_oe=%b tx_load=%b tx_en=%b rd_data_event=%b shift=0x%02h scl=%b sda=%b",
+          state_q,
+          addr7_q,
+          rw_q,
+          addr_match_i,
+          gc_match_i,
+          sda_oe,
+          tx_load_o,
+          tx_drive_en_o,
+          rd_byte_o,
+          shift_reg_q,
+          scl_filt_q,
+          sda_filt_q
+        );
+  
+      end
+  
+    end
+  `endif
 endmodule
 
 `default_nettype wire

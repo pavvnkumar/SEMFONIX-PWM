@@ -8,7 +8,7 @@
 //   1. Bare TX reset.
 //   2. Bare MSB-first transfer.
 //   3. Immediate disable/release.
-//   4. Load while disabled.
+//   4. Load while disabled, then enable and verify MSB.
 //   5. 5,000 randomized TX bytes.
 //
 // Integration:
@@ -25,42 +25,53 @@
 //       |
 //       +--> i2c_tx
 //
-// The integration tests verify:
+// Integration tests:
 //
 //   6. Single-byte write/readback.
 //   7. Two-byte auto-increment readback.
 //   8. Read/NACK followed by fresh write.
 //
-// IMPORTANT:
+// TX CONTRACT
+// -----------
 //
-// The master leaves SDA released for a full SCL-low period before raising
-// SCL for every read bit. This is required because the SEMFONIX register
-// read path is synchronous:
+// i2c_rx generates rd_byte_o first and tx_load_o one clk_ref cycle later.
 //
-//     rd_byte
-//       -> register_decode
-//       -> register_bank
-//       -> rd_data
-//       -> i2c_tx
+// Therefore:
 //
-// The DUT therefore has the complete SCL-low interval to prepare SDA.
+//   rd_byte_o
+//       -> register_decode captures rb_rdata_i
+//       -> rd_data_o becomes the registered read value
+//       -> tx_load_o
+//       -> i2c_tx captures tx_data_i
+//
+// i2c_tx does NOT introduce another load delay.
+//
+// Once loaded, shift_reg_q[7] is the first data bit. The first bit is
+// presented while SCL is LOW and remains stable during SCL HIGH.
+//
+// Subsequent bits advance on SCL falling edges.
+//
+// The master therefore releases SDA for the complete SCL-low interval
+// before every read-bit sampling edge.
 // =============================================================================
 
 `timescale 1ns/1ps
 
 module i2c_tx_tb;
 
-  localparam time CLK_PERIOD       = 10ns;
-  localparam int HALF_BIT_CYCLES  = 20;
-  localparam int HALF_BIT_BARE    = 6;
+  localparam time CLK_PERIOD      = 10ns;
+  localparam int HALF_BIT_CYCLES = 20;
+  localparam int HALF_BIT_BARE   = 6;
 
-  localparam bit [6:0] HW_ADDR = 7'h15;
+  localparam bit [5:0] HW_ADDR_PINS = 6'h15;
+  localparam bit [6:0] I2C_ADDR     = {1'b1, HW_ADDR_PINS};
 
   localparam bit [7:0] ADDR_MODE1     = 8'h00;
   localparam bit [7:0] ADDR_LED0_ON_L = 8'h06;
 
   int errors = 0;
   int checks = 0;
+
 
   // ===========================================================================
   // CHECK HELPERS
@@ -101,6 +112,7 @@ module i2c_tx_tb;
 
     if (cond !== 1'b1) begin
       errors++;
+
       $display(
         "FAIL [%s]: expected true",
         tag
@@ -160,9 +172,11 @@ module i2c_tx_tb;
     output bit sampled_bit
   );
 
+    // SCL LOW.
     repeat (HALF_BIT_BARE)
       @(posedge clk_ref);
 
+    // Rising edge.
     bare_scl = 1'b1;
 
     repeat (HALF_BIT_BARE/2)
@@ -175,10 +189,15 @@ module i2c_tx_tb;
     repeat (HALF_BIT_BARE/2)
       @(posedge clk_ref);
 
+    // Falling edge.
     bare_scl = 1'b0;
 
   endtask
 
+
+  // ===========================================================================
+  // BARE RESET
+  // ===========================================================================
 
   task automatic bare_reset();
 
@@ -199,22 +218,46 @@ module i2c_tx_tb;
   endtask
 
 
+  // ===========================================================================
+  // BARE SHIFT OUT BYTE
+  // ===========================================================================
+
   task automatic bare_shift_out_byte(
-    input  logic [7:0] data,
+    input logic [7:0] data,
     output logic [7:0] got
   );
 
     bit b;
+
+    // -------------------------------------------------------------------------
+    // Load.
+    //
+    // tx_load_i is the authoritative load event.
+    // TX captures tx_data_i on this clock edge.
+    // -------------------------------------------------------------------------
 
     bare_tx_data = data;
     bare_tx_load = 1'b1;
 
     @(posedge clk_ref);
 
-    bare_tx_load     = 1'b0;
+    bare_tx_load = 1'b0;
+
+    // -------------------------------------------------------------------------
+    // Enable TX after the load.
+    //
+    // The first bit is immediately represented by shift_reg_q[7].
+    // -------------------------------------------------------------------------
+
     bare_tx_drive_en = 1'b1;
 
+    #1;
+
     got = 8'h00;
+
+    // -------------------------------------------------------------------------
+    // Shift out MSB first.
+    // -------------------------------------------------------------------------
 
     for (int i = 7; i >= 0; i--) begin
 
@@ -302,7 +345,7 @@ module i2c_tx_tb;
   address_decode addr_dec (
     .addr7_i             (dut_addr7),
     .rw_i                (dut_rw),
-    .hw_addr_i           (HW_ADDR),
+    .hw_addr_i           (HW_ADDR_PINS),
     .active_allcall_i    (1'b0),
     .active_subx_en_i    (3'b000),
     .active_allcalladr_i (7'h00),
@@ -435,13 +478,38 @@ module i2c_tx_tb;
     .active_ai_o         (ai_en),
     .active_allcall_o    (),
     .active_subx_en_o    (),
-    .active_outne_o      (),
+    .active_outne_o       (),
     .active_outdrv_o     (),
     .active_invrt_o      (),
     .active_och_o        (),
     .active_allcalladr_o (),
     .active_subadr_o     ()
   );
+
+
+  // ===========================================================================
+  // READ PIPE DEBUG
+  // ===========================================================================
+
+  always @(posedge clk_ref) begin
+
+    if (rd_byte || tx_load) begin
+
+      $display(
+        "[READ PIPE DEBUG] rd_byte=%b tx_load=%b ptr=0x%02h rb_addr=0x%02h rb_rdata=0x%02h rd_data=0x%02h tx_drive=%b tx_sda_oe=%b",
+        rd_byte,
+        tx_load,
+        ptr_val,
+        rb_addr,
+        rb_rdata,
+        rd_data,
+        tx_drive_en,
+        tx_sda_oe
+      );
+
+    end
+
+  end
 
 
   // ===========================================================================
@@ -485,7 +553,7 @@ module i2c_tx_tb;
     repeat (HALF_BIT_CYCLES)
       @(posedge clk_ref);
 
-    // Return SCL LOW.
+    // SCL LOW.
     master_scl = 1'b0;
 
   endtask
@@ -532,6 +600,7 @@ module i2c_tx_tb;
     repeat (HALF_BIT_CYCLES/2)
       @(posedge clk_ref);
 
+    // SCL LOW.
     master_scl = 1'b0;
 
   endtask
@@ -553,12 +622,19 @@ module i2c_tx_tb;
   // ===========================================================================
   // MASTER: READ BYTE
   //
-  // IMPORTANT:
+  // The master releases SDA for the COMPLETE SCL-low interval before every
+  // rising edge. This gives the synchronous register-read pipeline time to
+  // produce the byte and allows i2c_tx to load it before sampling.
   //
-  // SDA is released while SCL is LOW for the COMPLETE low period before
-  // every rising edge.
+  // The extra reference-clock edge is intentional:
   //
-  // This allows the synchronous SEMFONIX read pipeline to complete.
+  //   rd_byte
+  //       -> rd_data_q capture
+  //       -> tx_load
+  //       -> TX shift register capture
+  //       -> first bit sampled
+  //
+  // It is protocol-independent because it occurs while SCL is LOW.
   // ===========================================================================
 
   task automatic m_read_byte(
@@ -570,15 +646,17 @@ module i2c_tx_tb;
 
     for (int i = 7; i >= 0; i--) begin
 
-      // Master releases SDA before requesting the next data bit.
+      // -----------------------------------------------------------------------
+      // Release SDA before requesting this bit.
+      // -----------------------------------------------------------------------
+
       master_sda_drive = 1'b0;
 
-      // Complete SCL LOW period.
+      // Complete SCL LOW interval.
       repeat (HALF_BIT_CYCLES)
         @(posedge clk_ref);
 
-      // Give one additional reference-clock edge for registered
-      // read-data propagation before the sampling edge.
+      // Allow the synchronous read pipeline to settle.
       @(posedge clk_ref);
 
       // SCL HIGH.
@@ -613,6 +691,7 @@ module i2c_tx_tb;
 
     // Bus idle.
     master_sda_drive = 1'b0;
+    master_sda_val   = 1'b1;
     master_scl       = 1'b1;
 
     repeat (HALF_BIT_CYCLES)
@@ -726,7 +805,7 @@ module i2c_tx_tb;
     expect_eq(
       bare_sda_oe,
       1'b0,
-      "bare_reset_sda_oe"
+      "t1_bare_reset_sda_oe"
     );
 
 
@@ -742,7 +821,7 @@ module i2c_tx_tb;
     expect_eq(
       got,
       8'hA5,
-      "bare_directed_byte_0xA5"
+      "t2_bare_directed_byte_0xA5"
     );
 
 
@@ -759,16 +838,9 @@ module i2c_tx_tb;
     bare_tx_load     = 1'b0;
     bare_tx_drive_en = 1'b1;
 
-    repeat (HALF_BIT_BARE)
-      @(posedge clk_ref);
-
-    bare_scl = 1'b1;
-
-    repeat (HALF_BIT_BARE/2)
-      @(posedge clk_ref);
-
     #1;
 
+    // 0x00 MSB must actively pull SDA LOW.
     expect_true(
       bare_sda_oe,
       "t3_driving_low_bit_before_disable"
@@ -784,6 +856,7 @@ module i2c_tx_tb;
       "t3_disable_immediately_releases_bus"
     );
 
+    // Return SCL to LOW and verify a completely fresh byte can be loaded.
     repeat (HALF_BIT_BARE)
       @(posedge clk_ref);
 
@@ -806,6 +879,12 @@ module i2c_tx_tb;
 
     // ========================================================================
     // TEST 4: LOAD WHILE DISABLED
+    //
+    // New TX contract:
+    //
+    //   load byte while TX disabled
+    //   enable TX later
+    //   loaded MSB must already be present
     // ========================================================================
 
     bare_tx_data     = 8'h80;
@@ -814,23 +893,27 @@ module i2c_tx_tb;
 
     @(posedge clk_ref);
 
+    bare_tx_load = 1'b0;
+
     #1;
 
+    // TX is disabled, so it must not drive the bus.
     expect_eq(
       bare_sda_oe,
       1'b0,
-      "t4_no_drive_while_disabled_at_load"
+      "t4_no_drive_while_disabled_after_load"
     );
 
-    bare_tx_load     = 1'b0;
+    // Enable after the load.
     bare_tx_drive_en = 1'b1;
 
     #1;
 
+    // 0x80 MSB = 1, therefore SDA must be released.
     expect_eq(
       bare_sda_oe,
       1'b0,
-      "t4_msb1_released_immediately_on_enable"
+      "t4_loaded_msb1_released_on_enable"
     );
 
     bare_tx_drive_en = 1'b0;
@@ -885,7 +968,7 @@ module i2c_tx_tb;
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b0},
+      {I2C_ADDR, 1'b0},
       ack_ok
     );
 
@@ -917,11 +1000,14 @@ module i2c_tx_tb;
     m_stop();
 
 
+    // ------------------------------------------------------------------------
     // Read transaction.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b1},
+      {I2C_ADDR, 1'b1},
       ack_ok
     );
 
@@ -950,11 +1036,14 @@ module i2c_tx_tb;
 
     do_reset();
 
+    // ------------------------------------------------------------------------
     // Enable MODE1.AI.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b0},
+      {I2C_ADDR, 1'b0},
       ack_ok
     );
 
@@ -995,11 +1084,14 @@ module i2c_tx_tb;
     );
 
 
+    // ------------------------------------------------------------------------
     // Write 0x11 and 0x22.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b0},
+      {I2C_ADDR, 1'b0},
       ack_ok
     );
 
@@ -1021,11 +1113,14 @@ module i2c_tx_tb;
     m_stop();
 
 
+    // ------------------------------------------------------------------------
     // Read both bytes.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b1},
+      {I2C_ADDR, 1'b1},
       ack_ok
     );
 
@@ -1068,7 +1163,7 @@ module i2c_tx_tb;
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b0},
+      {I2C_ADDR, 1'b0},
       ack_ok
     );
 
@@ -1085,11 +1180,14 @@ module i2c_tx_tb;
     m_stop();
 
 
+    // ------------------------------------------------------------------------
     // Read and NACK.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b1},
+      {I2C_ADDR, 1'b1},
       ack_ok
     );
 
@@ -1112,11 +1210,14 @@ module i2c_tx_tb;
     m_stop();
 
 
+    // ------------------------------------------------------------------------
     // Fresh write after NACK.
+    // ------------------------------------------------------------------------
+
     m_start();
 
     m_write_byte(
-      {HW_ADDR, 1'b0},
+      {I2C_ADDR, 1'b0},
       ack_ok
     );
 
